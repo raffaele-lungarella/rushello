@@ -28,7 +28,13 @@ fn repl() {
             continue; // Noop
         }
 
-        let tokens = parser::parse(&input);
+        let tokens = match parser::parse(&input) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                eprintln!("parse: {error}");
+                continue;
+            }
+        };
 
         let Some((command, args)) = tokens.split_first() else {
             continue;
