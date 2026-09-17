@@ -1,3 +1,5 @@
+mod parser;
+
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -9,6 +11,39 @@ use std::str::FromStr;
 
 fn main() {
     repl();
+}
+
+fn repl() {
+    loop {
+        print!("$ ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).unwrap() == 0 {
+            println!();
+            break;
+        }
+
+        if input.is_empty() {
+            continue; // Noop
+        }
+
+        let tokens = parser::parse(&input);
+
+        let Some((command, args)) = tokens.split_first() else {
+            continue;
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        match Builtin::from_str(command) {
+            Ok(Builtin::Exit) => break,
+            Ok(Builtin::Echo) => println!("{}", args.join(" ")),
+            Ok(Builtin::Type) => run_type(&args),
+            Ok(Builtin::Pwd) => run_pwd(),
+            Ok(Builtin::Cd) => run_cd(&args),
+            Err(cmd) => run_executable(&cmd, &args),
+        }
+    }
 }
 
 enum Builtin {
@@ -44,35 +79,6 @@ impl FromStr for Builtin {
             "pwd" => Ok(Builtin::Pwd),
             "cd" => Ok(Builtin::Cd),
             cmd => Err(cmd.to_owned()),
-        }
-    }
-}
-
-fn repl() {
-    loop {
-        print!("$ ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).unwrap() == 0 {
-            println!();
-            break;
-        }
-
-        let mut tokens = input.split_whitespace();
-        let Some(command) = tokens.next() else {
-            continue;
-        };
-
-        let args: Vec<&str> = tokens.collect();
-
-        match Builtin::from_str(command) {
-            Ok(Builtin::Exit) => break,
-            Ok(Builtin::Echo) => println!("{}", args.join(" ")),
-            Ok(Builtin::Type) => run_type(&args),
-            Ok(Builtin::Pwd) => run_pwd(),
-            Ok(Builtin::Cd) => run_cd(&args),
-            Err(cmd) => run_executable(&cmd, &args),
         }
     }
 }
