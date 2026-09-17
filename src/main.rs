@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 
 fn main() {
@@ -60,30 +62,43 @@ fn repl() {
         match Builtin::from_str(command) {
             Ok(Builtin::Exit) => break,
             Ok(Builtin::Echo) => println!("{}", args.join(" ")),
-            Ok(Builtin::Type) => run_type(args),
-            Err(cmd) => println!("{cmd}: command not found"),
+            Ok(Builtin::Type) => run_type(&args),
+            Err(cmd) => run_executable(&cmd, &args),
         }
     }
 }
 
-fn run_type(args: Vec<&str>) {
+fn find_executable(command: &str) -> Option<PathBuf> {
+    env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(command))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
+fn run_type(args: &[&str]) {
     for arg in args {
-        if Builtin::ALL.iter().any(|builtin| builtin.name() == arg) {
+        if Builtin::ALL.iter().any(|builtin| builtin.name() == *arg) {
             println!("{arg} is a shell builtin");
             continue;
         }
 
-        let executable = env::split_paths(&env::var_os("PATH").unwrap_or_default())
-            .map(|directory| directory.join(arg))
-            .find(|candidate| {
-                fs::metadata(candidate).is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            });
-
-        match executable {
+        match find_executable(arg) {
             Some(path) => println!("{arg} is {}", path.display()),
             None => println!("{arg}: not found"),
         }
+    }
+}
+
+fn run_executable(command: &str, args: &[&str]) {
+    let Some(path) = find_executable(command) else {
+        println!("{command}: command not found");
+        return;
+    };
+
+    if let Err(error) = Command::new(path).args(args).status() {
+        eprintln!("{command}: {error}");
     }
 }
