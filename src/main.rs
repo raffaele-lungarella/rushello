@@ -15,16 +15,20 @@ enum Builtin {
     Exit,
     Echo,
     Type,
+    Pwd,
+    Cd,
 }
 
 impl Builtin {
-    const ALL: [Self; 3] = [Self::Exit, Self::Echo, Self::Type];
+    const ALL: [Self; 5] = [Self::Exit, Self::Echo, Self::Type, Self::Pwd, Self::Cd];
 
     fn name(&self) -> &'static str {
         match self {
             Self::Exit => "exit",
             Self::Echo => "echo",
             Self::Type => "type",
+            Self::Pwd => "pwd",
+            Self::Cd => "cd",
         }
     }
 }
@@ -37,6 +41,8 @@ impl FromStr for Builtin {
             "exit" => Ok(Builtin::Exit),
             "echo" => Ok(Builtin::Echo),
             "type" => Ok(Builtin::Type),
+            "pwd" => Ok(Builtin::Pwd),
+            "cd" => Ok(Builtin::Cd),
             cmd => Err(cmd.to_owned()),
         }
     }
@@ -64,8 +70,36 @@ fn repl() {
             Ok(Builtin::Exit) => break,
             Ok(Builtin::Echo) => println!("{}", args.join(" ")),
             Ok(Builtin::Type) => run_type(&args),
+            Ok(Builtin::Pwd) => run_pwd(),
+            Ok(Builtin::Cd) => run_cd(&args),
             Err(cmd) => run_executable(&cmd, &args),
         }
+    }
+}
+
+fn run_pwd() {
+    match env::current_dir() {
+        Ok(directory) => println!("{}", directory.display()),
+        Err(error) => eprintln!("pwd: {error}"),
+    }
+}
+
+fn run_cd(args: &[&str]) {
+    let target = match args.first() {
+        Some(&"~") | None => match env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => {
+                eprintln!("cd: HOME not set");
+                return;
+            }
+        },
+        Some(path) => PathBuf::from(path),
+    };
+
+    if let Err(error) = env::set_current_dir(&target) {
+        let message = error.to_string();
+        let message = message.split(" (os error").next().unwrap_or(&message);
+        eprintln!("cd: {}: {message}", target.display());
     }
 }
 
