@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -98,7 +99,7 @@ fn run_executable(command: &str, args: &[&str]) {
         return;
     };
 
-    if let Err(error) = Command::new(path).args(args).status() {
+    if let Err(error) = Command::new(path).arg0(command).args(args).status() {
         eprintln!("{command}: {error}");
     }
 }
