@@ -1,4 +1,7 @@
+use std::env;
+use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
 
 fn main() {
@@ -57,16 +60,30 @@ fn repl() {
         match Builtin::from_str(command) {
             Ok(Builtin::Exit) => break,
             Ok(Builtin::Echo) => println!("{}", args.join(" ")),
-            Ok(Builtin::Type) => {
-                if let Some(arg) = args.first() {
-                    if Builtin::ALL.iter().any(|builtin| builtin.name() == *arg) {
-                        println!("{arg} is a shell builtin");
-                    } else {
-                        println!("{arg}: not found");
-                    }
-                }
-            }
+            Ok(Builtin::Type) => run_type(args),
             Err(cmd) => println!("{cmd}: command not found"),
+        }
+    }
+}
+
+fn run_type(args: Vec<&str>) {
+    for arg in args {
+        if Builtin::ALL.iter().any(|builtin| builtin.name() == arg) {
+            println!("{arg} is a shell builtin");
+            continue;
+        }
+
+        let executable = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join(arg))
+            .find(|candidate| {
+                fs::metadata(candidate).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            });
+
+        match executable {
+            Some(path) => println!("{arg} is {}", path.display()),
+            None => println!("{arg}: not found"),
         }
     }
 }
