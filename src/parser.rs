@@ -1,10 +1,10 @@
-//! Tokenizes shell input and separates command arguments from stdout redirections.
+//! Tokenizes shell input and separates command arguments from output redirections.
 //!
-//! [`tokenize`] handles quotes, backslash escapes, and the `>` / `1>` operators.
+//! [`tokenize`] handles quotes, escapes, `>` / `1>` / `2>`, and `>>` / `1>>`.
 //! [`parse`] interprets those tokens without opening files or executing commands.
 //!
 //! This is a small shell syntax subset: expansion, pipelines, other file descriptors,
-//! and append/input redirection are not implemented. Unsupported shell syntax is
+//! and stderr append/input redirection are not implemented. Unsupported shell syntax is
 //! not necessarily rejected; it may be interpreted as ordinary words.
 
 /// Determines whether whitespace, quotes, and backslashes have special meaning.
@@ -34,6 +34,8 @@ pub enum Token {
     Word(String),
     /// Both `>` and `1>` redirect stdout and produce this token.
     RedirectOut,
+    /// Both `>>` and `1>>` append to stdout's destination.
+    AppendOut,
     /// '2>' produces this token.
     RedirectErr,
 }
@@ -48,6 +50,8 @@ pub enum OutputStream {
 pub struct Redirection {
     pub stream: OutputStream,
     pub target: String,
+    /// Append rather than truncate when opening the destination.
+    pub append: bool,
 }
 
 /// A simple command ready for the executor to resolve its output destinations.
@@ -56,12 +60,12 @@ pub struct ParsedCommand {
     /// Command name followed by its arguments, excluding redirection syntax.
     /// Empty for blank input or a command consisting only of redirections.
     pub args: Vec<String>,
-    /// Output filenames in source order. The executor must open/truncate each
-    /// target in order; only the last receives the command's stdout.
+    /// Destinations in source order, opened according to their append mode.
+    /// The last destination for each stream receives that stream's output.
     pub redirects: Vec<Redirection>,
 }
 
-/// Separates words and stdout redirections, which may appear anywhere in the input.
+/// Separates words and output redirections, which may appear anywhere in the input.
 ///
 /// For example, `echo >"my file" hello` yields arguments `["echo", "hello"]`
 /// and the output target `"my file"`. Empty input produces an empty command.
@@ -81,13 +85,23 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
             Token::RedirectOut => match tokens.next() {
                 Some(Token::Word(target)) => command.redirects.push(Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: target,
+                }),
+                _ => return Err(ParseError::MissingRedirectTarget),
+            },
+            Token::AppendOut => match tokens.next() {
+                Some(Token::Word(target)) => command.redirects.push(Redirection {
+                    stream: OutputStream::Stdout,
+                    target,
+                    append: true,
                 }),
                 _ => return Err(ParseError::MissingRedirectTarget),
             },
             Token::RedirectErr => match tokens.next() {
                 Some(Token::Word(target)) => command.redirects.push(Redirection {
                     stream: OutputStream::Stderr,
+                    append: false,
                     target: target,
                 }),
                 _ => return Err(ParseError::MissingRedirectTarget),
@@ -98,7 +112,7 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
     Ok(command)
 }
 
-/// Splits input into words and stdout-redirection operators in one pass.
+/// Splits input into words and output-redirection operators in one pass.
 ///
 /// Unquoted Unicode whitespace separates words. Quoted and unquoted fragments
 /// of a word are joined, and empty quoted words are preserved. Quoted or escaped
@@ -154,7 +168,11 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
             // In `hello1>out` or `"1">out`, the 1 belongs to the argument instead.
             ('1', QuoteState::Unquoted) if !token_started && characters.peek() == Some(&'>') => {
                 characters.next();
-                tokens.push(Token::RedirectOut);
+                if characters.next_if_eq(&'>').is_some() {
+                    tokens.push(Token::AppendOut);
+                } else {
+                    tokens.push(Token::RedirectOut);
+                }
             }
             ('2', QuoteState::Unquoted) if !token_started && characters.peek() == Some(&'>') => {
                 characters.next();
@@ -166,7 +184,11 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
                     tokens.push(Token::Word(std::mem::take(&mut current_token)));
                     token_started = false;
                 }
-                tokens.push(Token::RedirectOut);
+                if characters.next_if_eq(&'>').is_some() {
+                    tokens.push(Token::AppendOut);
+                } else {
+                    tokens.push(Token::RedirectOut);
+                }
             }
             (character, QuoteState::Unquoted) if character.is_whitespace() => {
                 if token_started {
@@ -204,6 +226,79 @@ mod tests {
     use super::{ParseError, Token, parse, tokenize};
 
     #[test]
+    fn parses_stdout_append_redirects() {
+        for input in [
+            "echo hello>>out",
+            "echo hello 1>>out",
+            "1>>out echo hello",
+            "echo >>out hello",
+        ] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", "hello"]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into(),
+                    append: true,
+                }]
+            );
+        }
+        assert_eq!(
+            tokenize("1>>out").unwrap(),
+            [Token::AppendOut, Token::Word("out".into())]
+        );
+    }
+
+    #[test]
+    fn preserves_literal_append_operators() {
+        for input in [r#"echo ">>""#, "echo '>>'", r"echo \>\>"] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", ">>"]);
+            assert!(command.redirects.is_empty());
+        }
+        for (input, argument) in [
+            ("echo hello1>>out", "hello1"),
+            ("echo '1'>>out", "1"),
+            (r"echo \1>>out", "1"),
+        ] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", argument]);
+            assert!(command.redirects[0].append);
+        }
+    }
+
+    #[test]
+    fn preserves_mixed_append_and_truncate_order() {
+        let command = parse(r#"echo >>"first file" >second 1>>third 2>errors"#).unwrap();
+        assert_eq!(
+            command.redirects,
+            [
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "first file".into(),
+                    append: true
+                },
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "second".into(),
+                    append: false
+                },
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "third".into(),
+                    append: true
+                },
+                Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "errors".into(),
+                    append: false
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parses_explicit_stdout_redirects() {
         for input in [
             "echo Hello David 1> out",
@@ -216,6 +311,7 @@ mod tests {
                 command.redirects,
                 [Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "out".to_owned(),
                 }]
             );
@@ -239,6 +335,7 @@ mod tests {
                 command.redirects,
                 [Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "out".into(),
                 }]
             );
@@ -288,6 +385,7 @@ mod tests {
                 command.redirects,
                 [Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "out".into(),
                 }]
             );
@@ -302,6 +400,7 @@ mod tests {
             command.redirects,
             [Redirection {
                 stream: OutputStream::Stdout,
+                append: false,
                 target: "my file".into(),
             }]
         );
@@ -314,10 +413,12 @@ mod tests {
             [
                 Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "first".into()
                 },
                 Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "second".into()
                 },
             ]
@@ -329,7 +430,10 @@ mod tests {
         for input in [
             "echo >",
             "echo > >out",
-            "echo >>out",
+            "echo >>",
+            "echo 1>>",
+            "echo >>>out",
+            "echo >> >out",
             "echo 2>",
             "echo 2> >out",
             "echo > 2>err",
@@ -347,6 +451,7 @@ mod tests {
                 command.redirects,
                 [Redirection {
                     stream: OutputStream::Stderr,
+                    append: false,
                     target: "err".into(),
                 }]
             );
@@ -366,14 +471,17 @@ mod tests {
             [
                 Redirection {
                     stream: OutputStream::Stderr,
+                    append: false,
                     target: "first error".into()
                 },
                 Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "out".into()
                 },
                 Redirection {
                     stream: OutputStream::Stderr,
+                    append: false,
                     target: "last".into()
                 },
             ]
@@ -396,6 +504,7 @@ mod tests {
                 command.redirects,
                 [Redirection {
                     stream: OutputStream::Stdout,
+                    append: false,
                     target: "out".into(),
                 }]
             );

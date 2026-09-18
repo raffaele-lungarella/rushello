@@ -51,7 +51,13 @@ fn execute(parsed: &parser::ParsedCommand) -> io::Result<bool> {
     // Open targets in order; the last destination for each stream wins.
     for redirection in &parsed.redirects {
         let target = &redirection.target;
-        let file = match fs::File::create(target) {
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(redirection.append)
+            .truncate(!redirection.append)
+            .open(target)
+        {
             Ok(file) => file,
             Err(error) => {
                 let errors: &mut dyn Write = match error_file.as_mut() {
