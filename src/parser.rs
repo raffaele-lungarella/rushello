@@ -1,10 +1,10 @@
 //! Tokenizes shell input and separates command arguments from output redirections.
 //!
-//! [`tokenize`] handles quotes, escapes, `>` / `1>` / `2>`, and `>>` / `1>>`.
+//! [`tokenize`] handles quotes, escapes, `>` / `1>` / `2>`, and `>>` / `1>>` / `2>>`.
 //! [`parse`] interprets those tokens without opening files or executing commands.
 //!
 //! This is a small shell syntax subset: expansion, pipelines, other file descriptors,
-//! and stderr append/input redirection are not implemented. Unsupported shell syntax is
+//! and input redirection are not implemented. Unsupported shell syntax is
 //! not necessarily rejected; it may be interpreted as ordinary words.
 
 /// Determines whether whitespace, quotes, and backslashes have special meaning.
@@ -38,6 +38,8 @@ pub enum Token {
     AppendOut,
     /// '2>' produces this token.
     RedirectErr,
+    /// `2>>` appends to stderr's destination.
+    AppendErr,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +95,14 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
             Token::AppendOut => match tokens.next() {
                 Some(Token::Word(target)) => command.redirects.push(Redirection {
                     stream: OutputStream::Stdout,
+                    target,
+                    append: true,
+                }),
+                _ => return Err(ParseError::MissingRedirectTarget),
+            },
+            Token::AppendErr => match tokens.next() {
+                Some(Token::Word(target)) => command.redirects.push(Redirection {
+                    stream: OutputStream::Stderr,
                     target,
                     append: true,
                 }),
@@ -176,7 +186,11 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
             }
             ('2', QuoteState::Unquoted) if !token_started && characters.peek() == Some(&'>') => {
                 characters.next();
-                tokens.push(Token::RedirectErr);
+                if characters.next_if_eq(&'>').is_some() {
+                    tokens.push(Token::AppendErr);
+                } else {
+                    tokens.push(Token::RedirectErr);
+                }
             }
             // Finish an adjacent word before emitting the operator: hello>out.
             ('>', QuoteState::Unquoted) => {
@@ -224,6 +238,88 @@ mod tests {
     use crate::parser::Redirection;
 
     use super::{ParseError, Token, parse, tokenize};
+
+    #[test]
+    fn parses_stderr_append_redirects() {
+        for input in [
+            "echo hello 2>> err",
+            "echo 2>>err hello",
+            "2>>err echo hello",
+        ] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", "hello"]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "err".into(),
+                    append: true,
+                }]
+            );
+        }
+        assert_eq!(
+            tokenize("2>>err").unwrap(),
+            [Token::AppendErr, Token::Word("err".into())]
+        );
+    }
+
+    #[test]
+    fn preserves_literal_stderr_append_operators() {
+        for input in ["echo '2>>'", r#"echo "2>>""#, r"echo 2\>\>"] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", "2>>"]);
+            assert!(command.redirects.is_empty());
+        }
+        for (input, argument) in [
+            ("echo hello2>>out", "hello2"),
+            ("echo 2 >>out", "2"),
+            ("echo '2'>>out", "2"),
+            (r"echo \2>>out", "2"),
+        ] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", argument]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into(),
+                    append: true,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn parses_mixed_stderr_append_redirects_in_order() {
+        let command = parse(r#"echo 2>>"first error" >out 2>last"#).unwrap();
+        assert_eq!(
+            command.redirects,
+            [
+                Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "first error".into(),
+                    append: true
+                },
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into(),
+                    append: false
+                },
+                Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "last".into(),
+                    append: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_stderr_append_targets() {
+        for input in ["echo 2>>", "echo 2>>>err", "echo 2>> >out"] {
+            assert_eq!(parse(input), Err(ParseError::MissingRedirectTarget));
+        }
+    }
 
     #[test]
     fn parses_stdout_append_redirects() {
