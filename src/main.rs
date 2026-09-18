@@ -46,12 +46,26 @@ fn repl() {
 
 fn execute(parsed: &parser::ParsedCommand) -> io::Result<bool> {
     let mut output_file = None;
-    // Open every target in order; only the last receives command output.
-    for target in &parsed.stdout_redirects {
-        output_file = Some(
-            fs::File::create(target)
-                .map_err(|error| io::Error::new(error.kind(), format!("{target}: {error}")))?,
-        );
+    let mut error_file: Option<fs::File> = None;
+    let mut stderr = io::stderr();
+    // Open targets in order; the last destination for each stream wins.
+    for redirection in &parsed.redirects {
+        let target = &redirection.target;
+        let file = match fs::File::create(target) {
+            Ok(file) => file,
+            Err(error) => {
+                let errors: &mut dyn Write = match error_file.as_mut() {
+                    Some(file) => file,
+                    None => &mut stderr,
+                };
+                writeln!(errors, "{target}: {error}")?;
+                return Ok(false);
+            }
+        };
+        match redirection.stream {
+            parser::OutputStream::Stdout => output_file = Some(file),
+            parser::OutputStream::Stderr => error_file = Some(file),
+        }
     }
 
     let Some((command, args)) = parsed.args.split_first() else {
@@ -62,29 +76,34 @@ fn execute(parsed: &parser::ParsedCommand) -> io::Result<bool> {
     let builtin = match Builtin::from_str(command) {
         Ok(builtin) => builtin,
         Err(_) => {
-            run_executable(command, &args, output_file)?;
+            run_executable(command, &args, output_file, error_file)?;
             return Ok(false);
         }
     };
 
     let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
     let mut context = ExecutionContext {
         stdout: match output_file.as_mut() {
             Some(file) => file,
             None => &mut stdout,
         },
-        stderr: &mut stderr,
+        stderr: match error_file.as_mut() {
+            Some(file) => file,
+            None => &mut stderr,
+        },
     };
 
-    match builtin {
+    let result = match builtin {
         Builtin::Exit => return Ok(true),
-        Builtin::Echo => context.echo(&args)?,
-        Builtin::Type => context.run_type(&args)?,
-        Builtin::Pwd => context.pwd()?,
-        Builtin::Cd => context.cd(&args)?,
+        Builtin::Echo => context.echo(&args),
+        Builtin::Type => context.run_type(&args),
+        Builtin::Pwd => context.pwd(),
+        Builtin::Cd => context.cd(&args),
+    };
+    if let Err(error) = result.and_then(|_| context.stdout.flush()) {
+        writeln!(context.stderr, "{command}: {error}")?;
     }
-    context.stdout.flush()?;
+    context.stderr.flush()?;
     Ok(false)
 }
 
@@ -187,9 +206,19 @@ fn find_executable(command: &str) -> Option<PathBuf> {
         })
 }
 
-fn run_executable(command: &str, args: &[&str], output_file: Option<fs::File>) -> io::Result<()> {
+fn run_executable(
+    command: &str,
+    args: &[&str],
+    output_file: Option<fs::File>,
+    mut error_file: Option<fs::File>,
+) -> io::Result<()> {
+    let mut stderr = io::stderr();
     let Some(path) = find_executable(command) else {
-        return writeln!(io::stderr(), "{command}: command not found");
+        let errors: &mut dyn Write = match error_file.as_mut() {
+            Some(file) => file,
+            None => &mut stderr,
+        };
+        return writeln!(errors, "{command}: command not found");
     };
 
     let mut child = Command::new(path);
@@ -197,9 +226,16 @@ fn run_executable(command: &str, args: &[&str], output_file: Option<fs::File>) -
     if let Some(file) = output_file {
         child.stdout(Stdio::from(file));
     }
-    child
-        .status()
-        .map_err(|error| io::Error::new(error.kind(), format!("{command}: {error}")))?;
+    if let Some(file) = error_file.as_ref() {
+        child.stderr(Stdio::from(file.try_clone()?));
+    }
+    if let Err(error) = child.status() {
+        let errors: &mut dyn Write = match error_file.as_mut() {
+            Some(file) => file,
+            None => &mut stderr,
+        };
+        writeln!(errors, "{command}: {error}")?;
+    }
     Ok(())
 }
 

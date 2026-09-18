@@ -34,6 +34,20 @@ pub enum Token {
     Word(String),
     /// Both `>` and `1>` redirect stdout and produce this token.
     RedirectOut,
+    /// '2>' produces this token.
+    RedirectErr,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Redirection {
+    pub stream: OutputStream,
+    pub target: String,
 }
 
 /// A simple command ready for the executor to resolve its output destinations.
@@ -44,7 +58,7 @@ pub struct ParsedCommand {
     pub args: Vec<String>,
     /// Output filenames in source order. The executor must open/truncate each
     /// target in order; only the last receives the command's stdout.
-    pub stdout_redirects: Vec<String>,
+    pub redirects: Vec<Redirection>,
 }
 
 /// Separates words and stdout redirections, which may appear anywhere in the input.
@@ -65,7 +79,17 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
         match token {
             Token::Word(word) => command.args.push(word),
             Token::RedirectOut => match tokens.next() {
-                Some(Token::Word(target)) => command.stdout_redirects.push(target),
+                Some(Token::Word(target)) => command.redirects.push(Redirection {
+                    stream: OutputStream::Stdout,
+                    target: target,
+                }),
+                _ => return Err(ParseError::MissingRedirectTarget),
+            },
+            Token::RedirectErr => match tokens.next() {
+                Some(Token::Word(target)) => command.redirects.push(Redirection {
+                    stream: OutputStream::Stderr,
+                    target: target,
+                }),
                 _ => return Err(ParseError::MissingRedirectTarget),
             },
         }
@@ -132,6 +156,10 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
                 characters.next();
                 tokens.push(Token::RedirectOut);
             }
+            ('2', QuoteState::Unquoted) if !token_started && characters.peek() == Some(&'>') => {
+                characters.next();
+                tokens.push(Token::RedirectErr);
+            }
             // Finish an adjacent word before emitting the operator: hello>out.
             ('>', QuoteState::Unquoted) => {
                 if token_started {
@@ -170,6 +198,9 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::parser::OutputStream;
+    use crate::parser::Redirection;
+
     use super::{ParseError, Token, parse, tokenize};
 
     #[test]
@@ -181,7 +212,13 @@ mod tests {
         ] {
             let command = parse(input).unwrap();
             assert_eq!(command.args, ["echo", "Hello", "David"]);
-            assert_eq!(command.stdout_redirects, ["out"]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".to_owned(),
+                }]
+            );
         }
         assert_eq!(parse("echo 1>"), Err(ParseError::MissingRedirectTarget));
     }
@@ -198,7 +235,13 @@ mod tests {
         ] {
             let command = parse(input).unwrap();
             assert_eq!(command.args, ["echo", argument]);
-            assert_eq!(command.stdout_redirects, ["out"]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into(),
+                }]
+            );
         }
     }
 
@@ -207,7 +250,7 @@ mod tests {
         for input in ["echo '1>'", r#"echo "1>""#, r"echo 1\>"] {
             let command = parse(input).unwrap();
             assert_eq!(command.args, ["echo", "1>"]);
-            assert!(command.stdout_redirects.is_empty());
+            assert!(command.redirects.is_empty());
         }
     }
 
@@ -241,7 +284,13 @@ mod tests {
         for input in ["echo hello >out", "echo >out hello", ">out echo hello"] {
             let command = parse(input).unwrap();
             assert_eq!(command.args, ["echo", "hello"]);
-            assert_eq!(command.stdout_redirects, ["out"]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into(),
+                }]
+            );
         }
     }
 
@@ -249,21 +298,116 @@ mod tests {
     fn parses_quoted_redirect_targets() {
         let command = parse(r#"echo >"my file" hello"#).unwrap();
         assert_eq!(command.args, ["echo", "hello"]);
-        assert_eq!(command.stdout_redirects, ["my file"]);
+        assert_eq!(
+            command.redirects,
+            [Redirection {
+                stream: OutputStream::Stdout,
+                target: "my file".into(),
+            }]
+        );
     }
 
     #[test]
     fn preserves_redirect_order() {
         assert_eq!(
-            parse("echo >first >second").unwrap().stdout_redirects,
-            ["first", "second"]
+            parse("echo >first >second").unwrap().redirects,
+            [
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "first".into()
+                },
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "second".into()
+                },
+            ]
         );
     }
 
     #[test]
     fn rejects_missing_redirect_targets() {
-        for input in ["echo >", "echo > >out", "echo >>out"] {
+        for input in [
+            "echo >",
+            "echo > >out",
+            "echo >>out",
+            "echo 2>",
+            "echo 2> >out",
+            "echo > 2>err",
+        ] {
             assert_eq!(parse(input), Err(ParseError::MissingRedirectTarget));
+        }
+    }
+
+    #[test]
+    fn parses_stderr_redirects() {
+        for input in ["echo hello 2> err", "echo 2>err hello", "2>err echo hello"] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", "hello"]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "err".into(),
+                }]
+            );
+        }
+        assert_eq!(
+            tokenize("2>err").unwrap(),
+            [Token::RedirectErr, Token::Word("err".into())]
+        );
+    }
+
+    #[test]
+    fn preserves_mixed_redirect_order() {
+        let command = parse(r#"echo 2>"first error" hello >out 2>last"#).unwrap();
+        assert_eq!(command.args, ["echo", "hello"]);
+        assert_eq!(
+            command.redirects,
+            [
+                Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "first error".into()
+                },
+                Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into()
+                },
+                Redirection {
+                    stream: OutputStream::Stderr,
+                    target: "last".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_literal_twos_before_redirects() {
+        for (input, argument) in [
+            ("echo hello2>out", "hello2"),
+            ("echo 2 >out", "2"),
+            ("echo '2'>out", "2"),
+            (r#"echo "2">out"#, "2"),
+            (r"echo \2>out", "2"),
+            ("echo ''2>out", "2"),
+        ] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", argument]);
+            assert_eq!(
+                command.redirects,
+                [Redirection {
+                    stream: OutputStream::Stdout,
+                    target: "out".into(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_quoted_and_escaped_stderr_operators() {
+        for input in ["echo '2>'", r#"echo "2>""#, r"echo 2\>"] {
+            let command = parse(input).unwrap();
+            assert_eq!(command.args, ["echo", "2>"]);
+            assert!(command.redirects.is_empty());
         }
     }
 
