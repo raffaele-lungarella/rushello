@@ -1,4 +1,5 @@
 mod parser;
+mod trie;
 
 use std::env;
 use std::fs;
@@ -9,20 +10,37 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
+
+use crate::trie::Trie;
+
 fn main() {
     repl();
 }
 
 fn repl() {
+    let config = Config::builder()
+        .completion_type(CompletionType::Circular)
+        .build();
+    let mut editor = Editor::<ShellHelper, DefaultHistory>::with_config(config)
+        .expect("failed to initialize editor");
+    editor.set_helper(Some(ShellHelper::new()));
     loop {
-        print!("$ ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).unwrap() == 0 {
-            println!();
-            break;
-        }
+        let input = match editor.readline("$ ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(error) => {
+                eprintln!("readline: {error}");
+                break;
+            }
+        };
 
         if input.is_empty() {
             continue; // Noop
@@ -42,6 +60,67 @@ fn repl() {
             Err(error) => eprintln!("{error}"),
         }
     }
+}
+
+struct ShellHelper {
+    builtins: Trie,
+}
+
+impl ShellHelper {
+    fn new() -> Self {
+        let mut builtins = Trie::default();
+        for builtin in Builtin::ALL {
+            builtins.insert(builtin.name());
+        }
+        Self { builtins }
+    }
+}
+
+impl Completer for ShellHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let before_cursor = &line[..pos];
+        let prefix = before_cursor.trim_start();
+        let start = before_cursor.len() - prefix.len();
+
+        // Only complete a bare command name, not arguments or shell syntax.
+        if prefix
+            .chars()
+            .any(|ch| ch.is_whitespace() || "\\\"'\\\\<>|;&".contains(ch))
+        {
+            return Ok((pos, Vec::new()));
+        }
+
+        let mut matches = self.builtins.words_with_prefix(prefix);
+        matches.sort();
+        let append_space = matches.len() == 1 && pos == line.len();
+        let candidates = matches
+            .into_iter()
+            .map(|name| Pair {
+                replacement: if append_space {
+                    format!("{name} ")
+                } else {
+                    name.clone()
+                },
+                display: name,
+            })
+            .collect();
+
+        Ok((start, candidates))
+    }
+}
+
+impl Helper for ShellHelper {}
+impl Highlighter for ShellHelper {}
+impl Validator for ShellHelper {}
+impl Hinter for ShellHelper {
+    type Hint = String;
 }
 
 fn execute(parsed: &parser::ParsedCommand) -> io::Result<bool> {
@@ -113,11 +192,6 @@ fn execute(parsed: &parser::ParsedCommand) -> io::Result<bool> {
     Ok(false)
 }
 
-struct ExecutionContext<'a> {
-    stdout: &'a mut dyn Write,
-    stderr: &'a mut dyn Write,
-}
-
 enum Builtin {
     Exit,
     Echo,
@@ -153,6 +227,11 @@ impl FromStr for Builtin {
             cmd => Err(cmd.to_owned()),
         }
     }
+}
+
+struct ExecutionContext<'a> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
 }
 
 impl ExecutionContext<'_> {
@@ -243,6 +322,63 @@ fn run_executable(
         writeln!(errors, "{command}: {error}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn complete(line: &str, pos: usize) -> (usize, Vec<Pair>) {
+        let history = DefaultHistory::new();
+        ShellHelper::new()
+            .complete(line, pos, &Context::new(&history))
+            .unwrap()
+    }
+
+    #[test]
+    fn completes_builtin_with_trailing_space() {
+        let (start, candidates) = complete("ech", 3);
+        assert_eq!(start, 0);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "echo");
+        assert_eq!(candidates[0].replacement, "echo ");
+    }
+
+    #[test]
+    fn returns_sorted_ambiguous_matches_without_spaces() {
+        let (_, candidates) = complete("e", 1);
+        let replacements: Vec<_> = candidates
+            .iter()
+            .map(|pair| pair.replacement.as_str())
+            .collect();
+        assert_eq!(replacements, ["echo", "exit"]);
+    }
+
+    #[test]
+    fn preserves_leading_whitespace() {
+        let (start, candidates) = complete("  pw", 4);
+        assert_eq!(start, 2);
+        assert_eq!(candidates[0].replacement, "pwd ");
+    }
+
+    #[test]
+    fn leaves_arguments_and_unknown_commands_alone() {
+        for line in ["echo e", "echo ", "unknown", "echo>e", "'ec", "\"ec"] {
+            assert!(complete(line, line.len()).1.is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn uses_cursor_position_without_adding_space_before_existing_text() {
+        let (start, candidates) = complete("ec argument", 2);
+        assert_eq!(start, 0);
+        assert_eq!(candidates[0].replacement, "echo");
+    }
+
+    #[test]
+    fn empty_input_lists_all_builtins() {
+        assert_eq!(complete("", 0).1.len(), Builtin::ALL.len());
+    }
 }
 
 #[cfg(test)]
