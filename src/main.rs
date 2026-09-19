@@ -31,6 +31,7 @@ fn repl() {
     let mut editor = Editor::<ShellHelper, DefaultHistory>::with_config(config)
         .expect("failed to initialize editor");
     editor.set_helper(Some(ShellHelper::new()));
+
     loop {
         let input = match editor.readline("$ ") {
             Ok(line) => line,
@@ -98,7 +99,31 @@ impl Completer for ShellHelper {
         }
 
         let mut matches = self.builtins.words_with_prefix(prefix);
+        let executable_matches: Vec<String> =
+            env::split_paths(&env::var_os("PATH").unwrap_or_default())
+                .filter_map(|dir| fs::read_dir(dir).ok())
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name().into_string().ok()?;
+
+                    if !name.starts_with(prefix) {
+                        return None;
+                    }
+
+                    let metadata = fs::metadata(entry.path()).ok()?;
+                    if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+        matches.extend(executable_matches);
         matches.sort();
+        matches.dedup();
+
         let append_space = matches.len() == 1 && pos == line.len();
         let candidates = matches
             .into_iter()
