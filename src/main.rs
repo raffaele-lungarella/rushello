@@ -26,7 +26,7 @@ fn main() {
 
 fn repl() {
     let config = Config::builder()
-        .completion_type(CompletionType::Circular)
+        .completion_type(CompletionType::List)
         .build();
     let mut editor = Editor::<ShellHelper, DefaultHistory>::with_config(config)
         .expect("failed to initialize editor");
