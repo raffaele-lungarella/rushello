@@ -9,7 +9,7 @@
 
 /// Determines whether whitespace, quotes, and backslashes have special meaning.
 enum QuoteState {
-    Unquoted,
+    None,
     Single,
     Double,
 }
@@ -137,7 +137,7 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
 pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let mut current_token = String::new();
-    let mut state = QuoteState::Unquoted;
+    let mut state = QuoteState::None;
     // An empty quoted word is still a token; String::is_empty cannot distinguish it
     // from whitespace between words.
     let mut token_started = false;
@@ -145,7 +145,7 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
     let mut characters = line.chars().peekable();
     while let Some(character) = characters.next() {
         match (character, &state) {
-            ('\\', QuoteState::Unquoted) => {
+            ('\\', QuoteState::None) => {
                 let escaped = characters.next().ok_or(ParseError::TrailingBackslash)?;
                 if escaped != '\n' {
                     current_token.push(escaped);
@@ -163,20 +163,20 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 _ => current_token.push('\\'),
             },
-            ('\'', QuoteState::Single) => state = QuoteState::Unquoted,
-            ('"', QuoteState::Double) => state = QuoteState::Unquoted,
-            ('\'', QuoteState::Unquoted) => {
+            ('\'', QuoteState::Single) => state = QuoteState::None,
+            ('"', QuoteState::Double) => state = QuoteState::None,
+            ('\'', QuoteState::None) => {
                 state = QuoteState::Single;
                 token_started = true;
             }
-            ('"', QuoteState::Unquoted) => {
+            ('"', QuoteState::None) => {
                 state = QuoteState::Double;
                 token_started = true;
             }
 
             // `1>` explicitly selects stdout; the unquoted 1 must start a word.
             // In `hello1>out` or `"1">out`, the 1 belongs to the argument instead.
-            ('1', QuoteState::Unquoted) if !token_started && characters.peek() == Some(&'>') => {
+            ('1', QuoteState::None) if !token_started && characters.peek() == Some(&'>') => {
                 characters.next();
                 if characters.next_if_eq(&'>').is_some() {
                     tokens.push(Token::AppendOut);
@@ -184,7 +184,7 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
                     tokens.push(Token::RedirectOut);
                 }
             }
-            ('2', QuoteState::Unquoted) if !token_started && characters.peek() == Some(&'>') => {
+            ('2', QuoteState::None) if !token_started && characters.peek() == Some(&'>') => {
                 characters.next();
                 if characters.next_if_eq(&'>').is_some() {
                     tokens.push(Token::AppendErr);
@@ -193,7 +193,7 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
                 }
             }
             // Finish an adjacent word before emitting the operator: hello>out.
-            ('>', QuoteState::Unquoted) => {
+            ('>', QuoteState::None) => {
                 if token_started {
                     tokens.push(Token::Word(std::mem::take(&mut current_token)));
                     token_started = false;
@@ -204,7 +204,7 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
                     tokens.push(Token::RedirectOut);
                 }
             }
-            (character, QuoteState::Unquoted) if character.is_whitespace() => {
+            (character, QuoteState::None) if character.is_whitespace() => {
                 if token_started {
                     tokens.push(Token::Word(std::mem::take(&mut current_token)));
                     token_started = false;
@@ -222,7 +222,7 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
     match state {
         QuoteState::Single => return Err(ParseError::UnclosedSingleQuote),
         QuoteState::Double => return Err(ParseError::UnclosedDoubleQuote),
-        QuoteState::Unquoted => {}
+        QuoteState::None => {}
     }
 
     if token_started {
